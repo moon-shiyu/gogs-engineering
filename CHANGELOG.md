@@ -4,10 +4,21 @@ All notable changes to Gogs are documented in this file.
 
 ## 0.15.0+dev (`main`)
 
+### Added
+
+- Configuration values can now be overridden with environment variables in the form `GOGS__<SECTION>__<KEY>` (e.g., `GOGS__DATABASE__HOST`), applied after `app.ini` and before command line flags. Setting a variable to an empty string overrides the value to empty, which is different from leaving it unset. The startup log lists every non-default value with its source, and sensitive values such as passwords and secret keys are always redacted.
+- Startup now validates the database, external URL, email, repository storage, temporary directories, and security settings, and reports every problem at once before the server accepts traffic.
+- The `/healthcheck` endpoint now reports database connectivity and the writability of key directories (data, repositories, logs, upload and LFS storage) in addition to process liveness, and recovers automatically once a failed dependency is healthy again. The Docker `HEALTHCHECK` now fails when the endpoint reports unavailability.
+- The server shuts down gracefully on `SIGINT` and `SIGTERM`, waiting for in-flight requests to finish up to the new `[server] GRACEFUL_SHUTDOWN_TIMEOUT` option (default `30s`).
+- An interrupted database migration is now detected at the next startup, which stops with recovery instructions instead of re-running migrations over a partially migrated database. A `gogs-migrating` marker file in the data directory records the interrupted state and must be removed manually after the database is inspected or restored.
+- Directories created during a failed startup (e.g., log and SSH key directories) are removed again automatically, while anything that may hold user data or require manual handling is kept and reported.
+
 ### Changed
 
 - Docker builds from `main` are now published only as `gogs/gogs:edge`, using the next-generation `Dockerfile.next`. The legacy `Dockerfile` no longer produces `main` builds. The `gogs/gogs:latest` and `gogs/gogs:next-latest` tags now always point to the highest published stable release, never to a back-patch on an older line. [#8278](https://github.com/gogs/gogs/pull/8278)
 - Self-registration is now disabled by default. New instances must set `[auth] DISABLE_REGISTRATION = false` to allow sign-ups. [#8350](https://github.com/gogs/gogs/pull/8350)
+- When the same option is set multiple times in `app.ini`, the last value now wins consistently and a startup warning names the option and the winning value.
+- Gogs now strips the subpath of `EXTERNAL_URL` (e.g., `https://example.com/gogs/`) from incoming requests for every server protocol, so routes, static assets, and the web frontend resolve identically behind a reverse proxy with or without prefix stripping.
 
 ### Fixed
 
@@ -38,6 +49,7 @@ All notable changes to Gogs are documented in this file.
 - _Security:_ Denial of service when rendering issue references against a malformed external issue tracker URL format. [#8312](https://github.com/gogs/gogs/pull/8312) - [GHSA-4j89-2c4f-44c6](https://github.com/gogs/gogs/security/advisories/GHSA-4j89-2c4f-44c6)
 - _Security:_ Stored XSS in Jupyter notebook (`.ipynb`) preview through Markdown links with `javascript:` URLs. [#8319](https://github.com/gogs/gogs/pull/8319) - [GHSA-jq8v-rmf6-65jw](https://github.com/gogs/gogs/security/advisories/GHSA-jq8v-rmf6-65jw)
 - _Security:_ Missing authorization check on the attachment download endpoint allowed anyone who knew (or guessed) an attachment UUID to download files belonging to private repositories. [#8320](https://github.com/gogs/gogs/pull/8320) - [GHSA-p9f5-h3rx-j5qw](https://github.com/gogs/gogs/security/advisories/GHSA-p9f5-h3rx-j5qw)
+- Rolling back to an older Gogs version no longer rewrites the database version record, so upgrading again later does not re-run migrations over existing data.
 - _Security:_ Organization team and member management actions accepted GET requests, allowing a logged-in owner to be tricked into adding an attacker to the Owners team via a crafted link. [#8321](https://github.com/gogs/gogs/pull/8321) - [GHSA-pwx3-qcgw-vh7h](https://github.com/gogs/gogs/security/advisories/GHSA-pwx3-qcgw-vh7h)
 - _Security:_ SSRF via mirror address update bypassing clone address validation. [#8225](https://github.com/gogs/gogs/pull/8225) - [GHSA-wv27-2vqp-j7g5](https://github.com/gogs/gogs/security/advisories/GHSA-wv27-2vqp-j7g5)
 - _Security:_ Open redirect on login and other post-action flows via the `redirect_to` query parameter. [#8322](https://github.com/gogs/gogs/pull/8322) - [GHSA-xxhq-69mf-w8cr](https://github.com/gogs/gogs/security/advisories/GHSA-xxhq-69mf-w8cr)

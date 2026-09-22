@@ -46,10 +46,17 @@ var File *ini.File
 // It is safe to call this function multiple times with desired `customConf`, but it is
 // not concurrent safe.
 //
+// Values are resolved from layered sources, later layers win: embedded
+// defaults, the custom configuration file, GOGS__ environment variables, and
+// command line overrides. Semantic problems are collected and returned
+// together as ValidationErrors instead of failing on the first one.
+//
 // NOTE: The order of loading configuration sections matters as one may depend on another.
 //
 // ⚠️ WARNING: Do not print anything in this function other than warnings.
 func Init(customConf string) error {
+	valueSources = map[string]map[string]ValueSource{}
+
 	data, err := conf.Files.ReadFile("app.ini")
 	if err != nil {
 		return errors.Wrap(err, `read default "app.ini"`)
@@ -63,6 +70,7 @@ func Init(customConf string) error {
 	}
 	File.NameMapper = ini.SnackCase
 	File.ValueMapper = os.ExpandEnv
+	markAllSources(File, SourceDefault)
 
 	if customConf == "" {
 		customConf = filepath.Join(CustomDir(), "conf", "app.ini")
@@ -75,12 +83,24 @@ func Init(customConf string) error {
 	CustomConf = customConf
 
 	if osx.IsFile(customConf) {
+		custom := parseShadowFile(customConf)
+		if custom != nil && !HookMode {
+			for _, warning := range duplicateKeyWarnings(custom, customConf) {
+				log.Warn("%s", warning)
+			}
+		}
+		markFileSources(custom, SourceFile)
 		if err = File.Append(customConf); err != nil {
 			return errors.Wrapf(err, "append %q", customConf)
 		}
 	} else if !HookMode {
 		return errors.Newf("custom config %q not found: see https://gogs.io/getting-started/installation#configuration for first-time setup", customConf)
 	}
+
+	applyEnvironmentOverrides(File)
+	applyOverrides(File, CommandLineOverrides, SourceCommandLine)
+
+	var errs []error
 
 	if err = File.Section(ini.DefaultSection).MapTo(&App); err != nil {
 		return errors.Wrap(err, "mapping default section")
@@ -106,16 +126,17 @@ func Init(customConf string) error {
 	}
 	Server.URL, err = url.Parse(Server.ExternalURL)
 	if err != nil {
-		return errors.Wrapf(err, "parse '[server] EXTERNAL_URL' %q", err)
+		errs = append(errs, errors.Wrapf(err, "parse '[server] EXTERNAL_URL' %q", Server.ExternalURL))
+	} else {
+		// Subpath should start with '/' and end without '/', i.e. '/{subpath}'.
+		Server.Subpath = strings.TrimRight(Server.URL.Path, "/")
+		Server.SubpathDepth = strings.Count(Server.Subpath, "/")
 	}
-
-	// Subpath should start with '/' and end without '/', i.e. '/{subpath}'.
-	Server.Subpath = strings.TrimRight(Server.URL.Path, "/")
-	Server.SubpathDepth = strings.Count(Server.Subpath, "/")
 
 	unixSocketMode, err := strconv.ParseUint(Server.UnixSocketPermission, 8, 32)
 	if err != nil {
-		return errors.Wrapf(err, "parse '[server] UNIX_SOCKET_PERMISSION' %q", Server.UnixSocketPermission)
+		errs = append(errs, errors.Wrapf(err, "parse '[server] UNIX_SOCKET_PERMISSION' %q", Server.UnixSocketPermission))
+		unixSocketMode = 0o666
 	}
 	if unixSocketMode > 0o777 {
 		unixSocketMode = 0o666
@@ -136,9 +157,9 @@ func Init(customConf string) error {
 
 	if !SSH.Disabled {
 		if !SSH.StartBuiltinServer {
-			if err := os.MkdirAll(SSH.RootPath, 0o700); err != nil {
+			if err := mkdirAllTracked(SSH.RootPath, 0o700); err != nil {
 				return errors.Wrap(err, "create SSH root directory")
-			} else if err = os.MkdirAll(SSH.KeyTestPath, 0o644); err != nil {
+			} else if err = mkdirAllTracked(SSH.KeyTestPath, 0o644); err != nil {
 				return errors.Wrap(err, "create SSH key test directory")
 			}
 		} else {
@@ -200,10 +221,6 @@ func Init(customConf string) error {
 		return errors.Wrap(err, "mapping [security] section")
 	}
 
-	if Security.SecretKey == "" || Security.SecretKey == "CHANGE-ME-OR-FAIL-TO-START" {
-		return errors.New("[security] SECRET_KEY must be set to a strong, unguessable value")
-	}
-
 	currentUser, match := CheckRunUser(App.RunUser)
 	if !match {
 		return errors.Newf("user configured to run Gogs is %q, but the current user is %q", App.RunUser, currentUser)
@@ -228,11 +245,11 @@ func Init(customConf string) error {
 			Email.From = Email.User
 		}
 
-		parsed, err := mail.ParseAddress(Email.From)
-		if err != nil {
-			return errors.Wrapf(err, "parse mail address %q", Email.From)
+		// An invalid address is reported by validate, which runs after all
+		// sections are mapped so that every problem surfaces at once.
+		if parsed, err := mail.ParseAddress(Email.From); err == nil {
+			Email.FromEmail = parsed.Address
 		}
-		Email.FromEmail = parsed.Address
 	}
 
 	// ***********************************
@@ -258,7 +275,8 @@ func Init(customConf string) error {
 		}
 		_, cidr, err := net.ParseCIDR(raw)
 		if err != nil {
-			return errors.Wrapf(err, "parse trusted proxy CIDR %q", raw)
+			errs = append(errs, errors.Wrapf(err, "parse trusted proxy CIDR %q", raw))
+			continue
 		}
 		Auth.TrustedProxyCIDRs = append(Auth.TrustedProxyCIDRs, cidr)
 	}
@@ -347,16 +365,16 @@ func Init(customConf string) error {
 	if Picture.EnableFederatedAvatar {
 		gravatarURL, err := url.Parse(Picture.GravatarSource)
 		if err != nil {
-			return errors.Wrapf(err, "parse Gravatar source %q", Picture.GravatarSource)
-		}
-
-		Picture.LibravatarService = libravatar.New()
-		if gravatarURL.Scheme == "https" {
-			Picture.LibravatarService.SetUseHTTPS(true)
-			Picture.LibravatarService.SetSecureFallbackHost(gravatarURL.Host)
+			errs = append(errs, errors.Wrapf(err, "parse Gravatar source %q", Picture.GravatarSource))
 		} else {
-			Picture.LibravatarService.SetUseHTTPS(false)
-			Picture.LibravatarService.SetFallbackHost(gravatarURL.Host)
+			Picture.LibravatarService = libravatar.New()
+			if gravatarURL.Scheme == "https" {
+				Picture.LibravatarService.SetUseHTTPS(true)
+				Picture.LibravatarService.SetSecureFallbackHost(gravatarURL.Host)
+			} else {
+				Picture.LibravatarService.SetUseHTTPS(false)
+				Picture.LibravatarService.SetFallbackHost(gravatarURL.Host)
+			}
 		}
 	}
 
@@ -425,6 +443,11 @@ func Init(customConf string) error {
 		return errors.Wrap(err, "mapping [prometheus] section")
 	} else if err = File.Section("other").MapTo(&Other); err != nil {
 		return errors.Wrap(err, "mapping [other] section")
+	}
+
+	errs = append(errs, validate()...)
+	if len(errs) > 0 {
+		return ValidationErrors(errs)
 	}
 
 	HasRobotsTxt = osx.IsFile(filepath.Join(CustomDir(), "robots.txt"))

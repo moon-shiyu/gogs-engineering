@@ -14,6 +14,10 @@ Running Gogs behind a reverse proxy allows you to serve it on standard ports (80
   Serving Gogs under a subpath (e.g., `https://example.com/gogs/`) makes it share a browser origin with every other site on the same host. Requests from those sibling sites are treated as same-site, so the `SameSite` attribute on the session cookie offers no protection against them. A compromised or malicious sibling site can then mount CSRF attacks against Gogs, such as forging state-changing requests with the victim's session. Only use a subpath when you fully trust every other application on the same host. Otherwise, serve Gogs on a dedicated subdomain.
 </Warning>
 
+<Tip>
+  Gogs strips the subpath of `EXTERNAL_URL` from incoming requests on its own, so routes, static assets, and the web frontend resolve identically whether or not the reverse proxy strips the prefix. The examples below strip the prefix at the proxy, but proxying the full path through also works.
+</Tip>
+
 ## Caddy 2
 
 <Tabs>

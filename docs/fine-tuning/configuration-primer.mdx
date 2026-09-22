@@ -4,16 +4,39 @@ description: "Fine tune your instance exactly the way you want."
 icon: "sliders"
 ---
 
-Gogs uses a layered configuration system. A default configuration is embedded in the binary, and you provide overrides in a custom file. Beyond `app.ini`, the `custom/` directory lets you override templates, static assets, locale files, and more.
+Gogs uses a layered configuration system. A default configuration is embedded in the binary, and you provide overrides in a custom file, environment variables, or command line flags. Beyond `app.ini`, the `custom/` directory lets you override templates, static assets, locale files, and more.
 
-## Two-layer configuration
+## Layered configuration
 
-Gogs reads configuration from two sources, in order:
+Gogs resolves every configuration value from up to four sources. Later sources always win over earlier ones:
 
 1. **Embedded defaults**: The [`conf/app.ini`](https://github.com/gogs/gogs/blob/main/conf/app.ini) file is compiled into the binary. You should never edit this file directly.
-2. **Custom overrides**: Your `custom/conf/app.ini` file. Any value you set here takes precedence over the embedded default.
+2. **Custom configuration file**: Your `custom/conf/app.ini` file (or the file passed with `--config`). Any value you set here takes precedence over the embedded default.
+3. **Environment variables**: Variables prefixed with `GOGS__` (see below).
+4. **Command line overrides**: Flags such as `--port` on `gogs web`.
 
-This separation means binary users can upgrade without losing their settings, and source installers benefit from `custom/` being in `.gitignore`.
+This order is identical for local runs, container starts, and upgrades, so a value you override behaves the same way no matter how the instance is launched. Binary users can upgrade without losing their settings, and source installers benefit from `custom/` being in `.gitignore`.
+
+At startup, Gogs logs every value that came from beyond the embedded defaults, along with the source it came from. Sensitive values (passwords, secret keys, tokens, and connection strings) are always redacted from these logs.
+
+### Environment variable overrides
+
+Any configuration value can be overridden with an environment variable named `GOGS__<SECTION>__<KEY>`, where the section name is uppercased and dots become underscores. For example:
+
+| Environment variable | Overrides |
+|----------------------|-----------|
+| `GOGS__SERVER__HTTP_PORT=3001` | `[server] HTTP_PORT` |
+| `GOGS__DATABASE__HOST=db.internal:5432` | `[database] HOST` |
+| `GOGS__REPOSITORY_UPLOAD__TEMP_PATH=/var/tmp` | `[repository.upload] TEMP_PATH` |
+| `GOGS__SECURITY__SECRET_KEY=...` | `[security] SECRET_KEY` |
+
+A variable that is set to an empty string overrides the value to empty. This is intentionally different from the variable being unset, which leaves the file value untouched.
+
+The older `GOGS_WORK_DIR` and `GOGS_CUSTOM` variables keep working as before: they relocate the work directory and the `custom/` directory itself, and are not part of the `GOGS__` override syntax.
+
+### Repeated options
+
+If the same option appears more than once in your `app.ini`, the last occurrence wins. Gogs logs a warning for every repeated option at startup, naming the option and the value that took effect, so the effective configuration is never a surprise.
 
 <Tip>
   The embedded [`conf/app.ini`](https://github.com/gogs/gogs/blob/main/conf/app.ini) contains every available option with detailed inline comments. Use it as your canonical reference.
@@ -73,6 +96,40 @@ Every Gogs subcommand accepts `-c, --config` to point to a configuration file at
 ```bash
 gogs web --config /etc/gogs/app.ini
 ```
+
+## Startup validation
+
+Gogs validates the resolved configuration before it starts accepting traffic. Every problem is reported at once instead of failing on the first one, so you can fix all of them in a single pass. This covers, among others:
+
+- Database connection settings (`[database]`)
+- External URL and ports (`[server]`)
+- Mail server settings when the email service is enabled (`[email]`)
+- Repository storage and upload temp directory (`[repository]`, `[repository.upload]`)
+- The security secret key (`[security] SECRET_KEY`)
+
+Validation messages never echo sensitive values. A startup that fails validation exits before the HTTP socket is opened, so a misconfigured instance never serves traffic.
+
+## Health checks
+
+The `/healthcheck` endpoint reports whether the instance is actually ready to serve, and is what the container images use for their `HEALTHCHECK`. Each request performs live checks, there is no cached success:
+
+- **Process**: the instance answers at all, and reports its instance ID.
+- **Database**: a real round-trip to the database with a bounded timeout. A restarted database flips the check to failing and back to healthy automatically.
+- **Key directories**: the data directory, repository root, and (when enabled) the log, upload temp, and LFS directories must be writable.
+
+The endpoint returns `200 OK` only when every check passes, and `503 Service Unavailable` otherwise, with one line per check explaining the outcome. A `HEAD` request returns just the status code. Because every check is live, the endpoint recovers on its own as soon as the dependency does.
+
+## Database migrations
+
+Upgrades run database migrations automatically, and each migration is recorded so a restart never runs them twice. While migrations are in flight, Gogs places a `gogs-migrating` marker file in the data directory:
+
+- If the process is interrupted mid-migration, the next start refuses to continue and tells you to inspect or restore the database before removing the marker. The marker is deliberately kept, because re-running a half-applied migration could corrupt data.
+- If the marker survives a completed migration (a crash at the exact wrong moment), Gogs removes the stale marker and starts normally.
+- Rolling back to an older Gogs version never rewrites the database version record, so upgrading again later does not re-apply migrations to your existing data.
+
+## Graceful shutdown
+
+On `SIGINT` or `SIGTERM`, Gogs stops accepting new connections and waits for in-flight requests to finish, up to `[server] GRACEFUL_SHUTDOWN_TIMEOUT` (default `30s`). Confirmed work is never truncated by a shutdown; requests that outlast the timeout are cut off only when it expires.
 
 ### What lives in `custom/`
 

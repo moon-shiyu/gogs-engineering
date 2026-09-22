@@ -18,9 +18,11 @@ import (
 	"xorm.io/core"
 	"xorm.io/xorm"
 
+	"gogs.io/gogs/internal/bootstate"
 	"gogs.io/gogs/internal/conf"
 	"gogs.io/gogs/internal/database/migrations"
 	"gogs.io/gogs/internal/dbx"
+	"gogs.io/gogs/internal/osx"
 )
 
 // Engine represents a XORM engine or session.
@@ -94,8 +96,13 @@ func getEngine() (*xorm.Engine, error) {
 		driver = "pgx"
 
 	case "sqlite3":
-		if err := os.MkdirAll(path.Dir(conf.Database.Path), os.ModePerm); err != nil {
+		dbDir := path.Dir(conf.Database.Path)
+		existed := osx.IsDir(dbDir)
+		if err := os.MkdirAll(dbDir, os.ModePerm); err != nil {
 			return nil, errors.Newf("create directories: %v", err)
+		}
+		if !existed {
+			bootstate.TrackDir(dbDir)
 		}
 		conf.UseSQLite3 = true
 		connStr = "file:" + conf.Database.Path + "?cache=shared&mode=rwc"
@@ -228,11 +235,13 @@ func GetStatistic(ctx context.Context) (stats Statistic) {
 	return stats
 }
 
-func Ping() error {
+// PingContext pings the database with the given context, so callers such as
+// the health check can bound the wait and never report a cached success.
+func PingContext(ctx context.Context) error {
 	if x == nil {
 		return errors.New("database not available")
 	}
-	return x.Ping()
+	return x.DB().PingContext(ctx)
 }
 
 // The version table. Should have only one row with id==1

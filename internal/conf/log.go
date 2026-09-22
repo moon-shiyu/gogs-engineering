@@ -138,7 +138,7 @@ func InitLogging(hookMode bool) {
 		return
 	}
 
-	err = os.MkdirAll(logConf.RootPath, os.ModePerm)
+	err = mkdirAllTracked(logConf.RootPath, os.ModePerm)
 	if err != nil {
 		log.Fatal("Failed to create log directory: %v", err)
 	}

@@ -275,6 +275,10 @@ type ServerOpts struct {
 	DisableRouterLog bool
 	EnableGzip       bool
 
+	// GracefulShutdownTimeout bounds how long the HTTP server waits for
+	// in-flight requests to finish after a shutdown signal arrives.
+	GracefulShutdownTimeout time.Duration `ini:"GRACEFUL_SHUTDOWN_TIMEOUT"`
+
 	AppDataPath        string
 	LoadAssetsFromDisk bool
 

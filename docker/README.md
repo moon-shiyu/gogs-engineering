@@ -52,7 +52,11 @@ SECRET_KEY = ${GOGS_SECURITY_SECRET_KEY}
 > [!NOTE]
 > `${...}` references in any value expand from the container's environment at startup, which keeps secrets out of `app.ini` on disk. Pass them with `docker run -e GOGS_DATABASE_PASSWORD=… -e GOGS_SECURITY_SECRET_KEY=…` (or `--env-file secrets.env`). Plain literal values work too, e.g., `PASSWORD = hunter2`.
 
+Any value can also be overridden directly with a `GOGS__<SECTION>__<KEY>` environment variable, e.g., `-e GOGS__SERVER__HTTP_PORT=3001` or `-e GOGS__DATABASE__HOST=db:5432`, without editing `app.ini` at all.
+
 See [configuration primer](https://gogs.io/fine-tuning/configuration-primer) to learn more about how the configuration system works.
+
+The container's `HEALTHCHECK` queries `/healthcheck`, which reports process liveness, database connectivity, and writability of key directories. The container is only marked healthy when all of them pass, and recovers automatically once a failed dependency (e.g., the database) is back.
 
 ### Bind mount
 

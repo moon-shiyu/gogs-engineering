@@ -1,11 +1,9 @@
 package web
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/fcgi"
 	"os"
@@ -29,6 +27,8 @@ import (
 
 	embedconf "gogs.io/gogs/conf"
 	"gogs.io/gogs/internal/app"
+	"gogs.io/gogs/internal/bootid"
+	"gogs.io/gogs/internal/bootstate"
 	"gogs.io/gogs/internal/conf"
 	"gogs.io/gogs/internal/context"
 	"gogs.io/gogs/internal/cron"
@@ -54,8 +54,22 @@ import (
 
 // Run starts the web server with the given configuration path and port override.
 func Run(configPath string, portOverride int) error {
+	if portOverride > 0 {
+		// Register the flag as a command line override so it lands in the
+		// fixed merge order and shows up in the effective configuration log.
+		conf.CommandLineOverrides = append(conf.CommandLineOverrides, conf.Override{
+			Section: "server",
+			Key:     "HTTP_PORT",
+			Value:   strconv.Itoa(portOverride),
+		})
+	}
+
 	err := initServices(configPath)
 	if err != nil {
+		// Reclaim what the failed startup created. Entries that need manual
+		// handling (e.g., an interrupted migration marker) are kept and their
+		// reasons are logged.
+		bootstate.Reclaim(log.Info)
 		return errors.Wrap(err, "initialize application")
 	}
 
@@ -615,73 +629,15 @@ func Run(configPath string, portOverride int) error {
 	}
 	log.Info("Available on %s", conf.Server.ExternalURL)
 
-	switch conf.Server.Protocol {
-	case "http":
-		err = http.ListenAndServe(listenAddr, m)
-
-	case "https":
-		tlsMinVersion := tls.VersionTLS12
-		switch conf.Server.TLSMinVersion {
-		case "TLS13":
-			tlsMinVersion = tls.VersionTLS13
-		case "TLS12":
-			tlsMinVersion = tls.VersionTLS12
-		case "TLS11":
-			tlsMinVersion = tls.VersionTLS11
-		case "TLS10":
-			tlsMinVersion = tls.VersionTLS10
+	if conf.Server.Protocol == "fcgi" {
+		// The fronting web server owns the listener lifecycle for FastCGI,
+		// so graceful shutdown is not applicable here.
+		if err := fcgi.Serve(nil, m); err != nil {
+			return errors.Wrap(err, "start server")
 		}
-		server := &http.Server{
-			Addr: listenAddr,
-			TLSConfig: &tls.Config{
-				MinVersion:               uint16(tlsMinVersion),
-				CurvePreferences:         []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521},
-				PreferServerCipherSuites: true,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-				},
-			}, Handler: m,
-		}
-		err = server.ListenAndServeTLS(conf.Server.CertFile, conf.Server.KeyFile)
-
-	case "fcgi":
-		err = fcgi.Serve(nil, m)
-
-	case "unix":
-		if osx.Exist(listenAddr) {
-			err = os.Remove(listenAddr)
-			if err != nil {
-				return errors.Wrap(err, "remove existing Unix domain socket")
-			}
-		}
-
-		var listener *net.UnixListener
-		listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: listenAddr, Net: "unix"})
-		if err != nil {
-			return errors.Wrap(err, "listen on Unix network")
-		}
-
-		// FIXME: add proper implementation of signal capture on all protocols
-		// execute this on SIGTERM or SIGINT: listener.Close()
-		if err = os.Chmod(listenAddr, conf.Server.UnixSocketMode); err != nil {
-			return errors.Wrap(err, "change permission of Unix domain socket")
-		}
-		err = http.Serve(listener, m)
-
-	default:
-		return errors.Newf("unexpected server protocol: %s", conf.Server.Protocol)
+		return nil
 	}
-
-	if err != nil {
-		return errors.Wrap(err, "start server")
-	}
-
-	return nil
+	return serveGracefully(m, listenAddr)
 }
 
 func newRoutingHandler() (http.Handler, error) {
@@ -760,9 +716,10 @@ func newMacaron() (*macaron.Macaron, error) {
 	if conf.Server.EnableGzip {
 		m.Use(gzip.Gziper())
 	}
-	if conf.Server.Protocol == "fcgi" {
-		m.SetURLPrefix(conf.Server.Subpath)
-	}
+	// Strip the configured subpath from incoming requests for every protocol
+	// so routes, static assets, and the web app shell resolve identically
+	// behind a reverse proxy and in direct mode.
+	m.SetURLPrefix(conf.Server.Subpath)
 
 	// Register custom middleware first to make it possible to override files under "public".
 	m.Use(macaron.Static(
@@ -901,35 +858,31 @@ func renderIndex(index []byte, wc context.WebContext, inject injectContent) ([]b
 	return []byte(strings.NewReplacer(pairs...).Replace(string(index))), nil
 }
 
-func healthCheck(w http.ResponseWriter, r *http.Request) {
-	if err := database.Ping(); err != nil {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, "* Database connection: %s\n", err)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
-		return
-	}
-	_, _ = w.Write([]byte("* Database connection: OK\n"))
-}
-
 func initServices(customConf string) error {
 	err := conf.Init(customConf)
 	if err != nil {
+		var verrs conf.ValidationErrors
+		if errors.As(err, &verrs) {
+			// Report every configuration problem at once instead of letting
+			// them surface one startup failure at a time.
+			for _, verr := range verrs {
+				log.Error("Invalid configuration: %v", verr)
+			}
+			return err
+		}
 		return errors.Wrap(err, "init configuration")
 	}
 
 	conf.InitLogging(false)
 	log.Info("%s %s", conf.App.BrandName, conf.App.Version)
+	log.Info("Instance ID: %s", bootid.Instance())
 	log.Trace("Work directory: %s", conf.WorkDir())
 	log.Trace("Custom path: %s", conf.CustomDir())
 	log.Trace("Custom config: %s", conf.CustomConf)
 	log.Trace("Log path: %s", conf.Log.RootPath)
 	log.Trace("Build time: %s", conf.BuildTime)
 	log.Trace("Build commit: %s", conf.BuildCommit)
+	conf.LogEffectiveConfig()
 
 	if conf.IsProdMode() {
 		macaron.Env = macaron.PROD

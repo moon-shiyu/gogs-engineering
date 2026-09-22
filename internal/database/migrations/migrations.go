@@ -1,12 +1,38 @@
 package migrations
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/cockroachdb/errors"
 	"gorm.io/gorm"
 	log "unknwon.dev/clog/v2"
+
+	"gogs.io/gogs/internal/bootid"
+	"gogs.io/gogs/internal/bootstate"
+	"gogs.io/gogs/internal/conf"
 )
 
 const minDBVersion = 19
+
+// markerName is the name of the marker file placed in the data directory
+// while migrations are in flight. Its presence at startup means the previous
+// run was interrupted before it could record completion.
+const markerName = "gogs-migrating"
+
+// markerPath returns the path of the migration marker file. It is a variable
+// so tests can point it at a temporary directory. An empty return disables
+// the marker mechanism, which only happens when the configuration has not
+// been initialized (e.g., in unit tests of individual migrations).
+var markerPath = func() string {
+	if conf.Server.AppDataPath == "" {
+		return ""
+	}
+	return filepath.Join(conf.Server.AppDataPath, markerName)
+}
 
 type Migration interface {
 	Description() string
@@ -120,10 +146,52 @@ In case you're stilling getting this notice, go through instructions again until
 		return nil
 	}
 
-	if int(current.Version-minDBVersion) > len(migrations) {
-		// User downgraded Gogs.
-		current.Version = int64(len(migrations) + minDBVersion)
-		return db.Where("id = ?", current.ID).Updates(current).Error
+	target := int64(minDBVersion + len(migrations))
+
+	if current.Version > target {
+		// The database was migrated by a newer Gogs version and the user
+		// rolled back to this one. Leave the version record untouched so a
+		// later upgrade does not re-run migrations over existing data.
+		log.Warn("Database version %d is newer than this Gogs version supports (%d), leaving the version record untouched", current.Version, target)
+		return nil
+	}
+
+	marker := markerPath()
+	if current.Version == target {
+		// A crash between the final version bump and the marker cleanup
+		// leaves a stale marker behind even though every migration ran.
+		if marker != "" {
+			if _, statErr := os.Stat(marker); statErr == nil {
+				if removeErr := os.Remove(marker); removeErr != nil {
+					return errors.Wrapf(removeErr, "remove stale migration marker %q", marker)
+				}
+				bootstate.DropKeep(marker)
+				log.Info("Removed stale migration marker %q from a completed migration", marker)
+			}
+		}
+		return nil
+	}
+
+	if marker != "" {
+		if content, readErr := os.ReadFile(marker); readErr == nil {
+			reason := fmt.Sprintf("a previous database migration did not finish (%s), the database may be partially migrated and needs manual inspection", strings.TrimSpace(string(content)))
+			bootstate.KeepOnFailure(marker, reason)
+			return errors.Newf(
+				"a previous database migration did not finish, the database may be in a partially migrated state. Restore the database from a backup or inspect it manually, then remove the marker file %q to retry. The marker is kept in place to avoid re-running migrations over inconsistent data",
+				marker,
+			)
+		}
+
+		// No migrations have run for this attempt yet, guard the whole batch.
+		if err = os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+			return errors.Wrap(err, "create migration marker directory")
+		}
+		content := fmt.Sprintf("started_at=%s instance=%s from_version=%d target_version=%d",
+			time.Now().UTC().Format(time.RFC3339), bootid.Instance(), current.Version, target)
+		if err = os.WriteFile(marker, []byte(content), 0o600); err != nil {
+			return errors.Wrap(err, "write migration marker")
+		}
+		bootstate.KeepOnFailure(marker, fmt.Sprintf("a database migration from version %d to %d did not finish, the database may be partially migrated and needs manual inspection", current.Version, target))
 	}
 
 	for _, m := range migrations[current.Version-minDBVersion:] {
@@ -140,6 +208,13 @@ In case you're stilling getting this notice, go through instructions again until
 		if err != nil {
 			return errors.Wrap(err, "update the version record")
 		}
+	}
+
+	if marker != "" {
+		if err = os.Remove(marker); err != nil {
+			return errors.Wrapf(err, "remove migration marker %q", marker)
+		}
+		bootstate.DropKeep(marker)
 	}
 	return nil
 }

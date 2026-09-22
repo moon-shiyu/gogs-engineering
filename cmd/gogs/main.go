@@ -52,4 +52,7 @@ func main() {
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		log.Fatal("Failed to start application: %v", err)
 	}
+	// Flush buffered log lines so a clean exit does not truncate the tail of
+	// the startup, migration, or shutdown sequence.
+	log.Stop()
 }

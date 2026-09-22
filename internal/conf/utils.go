@@ -1,11 +1,13 @@
 package conf
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/cockroachdb/errors"
 
+	"gogs.io/gogs/internal/bootstate"
 	"gogs.io/gogs/internal/osx"
 	"gogs.io/gogs/internal/process"
 )
@@ -34,6 +36,20 @@ func ensureAbs(path string) string {
 		return path
 	}
 	return filepath.Join(WorkDir(), path)
+}
+
+// mkdirAllTracked creates the directory like os.MkdirAll and, when the
+// directory did not exist before, records it so a failed startup can reclaim
+// it again.
+func mkdirAllTracked(path string, perm os.FileMode) error {
+	existed := osx.IsDir(path)
+	if err := os.MkdirAll(path, perm); err != nil {
+		return err
+	}
+	if !existed {
+		bootstate.TrackDir(path)
+	}
+	return nil
 }
 
 // CheckRunUser returns false if configured run user does not match actual user that

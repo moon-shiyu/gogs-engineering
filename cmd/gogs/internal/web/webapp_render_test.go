@@ -33,3 +33,30 @@ func TestRenderIndex_injection(t *testing.T) {
 	// The head injection lands inside <head>, before </head>.
 	assert.Less(t, strings.Index(out, `<meta name="head-marker">`), strings.Index(out, `</head>`))
 }
+
+func TestRenderIndex_subpath(t *testing.T) {
+	shell := `<html><head>{{.WebContext}}</head><body>` +
+		`<script src="./assets/index.js"></script>` +
+		`<link href="./assets/index.css">` +
+		`<script src="/src/main.tsx"></script>` +
+		`<link href="/img/favicon.png">` +
+		`</body></html>`
+
+	got, err := renderIndex([]byte(shell), context.WebContext{Lang: "en-US", SubURL: "/gogs"}, injectContent{})
+	require.NoError(t, err)
+
+	out := string(got)
+	// Asset and dev-server entrypoint paths are prefixed with the subpath so
+	// the shell works identically behind a reverse proxy mount.
+	assert.Contains(t, out, `src="/gogs/assets/index.js"`)
+	assert.Contains(t, out, `href="/gogs/assets/index.css"`)
+	assert.Contains(t, out, `src="/gogs/src/main.tsx"`)
+	assert.Contains(t, out, `href="/gogs/img/favicon.png"`)
+
+	// Without a subpath the shell stays untouched.
+	got, err = renderIndex([]byte(shell), context.WebContext{Lang: "en-US"}, injectContent{})
+	require.NoError(t, err)
+	out = string(got)
+	assert.Contains(t, out, `src="./assets/index.js"`)
+	assert.Contains(t, out, `src="/src/main.tsx"`)
+}
